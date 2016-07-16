@@ -7,8 +7,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io;
-use std::os::unix::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cargo::core::{Source, SourceId, Registry, Dependency};
 use cargo::ops;
@@ -18,38 +17,76 @@ use cargo::util::Config;
 use walkdir::{WalkDir, DirEntry, WalkDirIterator};
 
 fn main() {
-    if fs::metadata("index").is_err() {
+    let ref work_dir = PathBuf::from("work");
+    let ref index_path = work_dir.join("index");
+    let ref tmp_index_path = work_dir.join(".index");
+    let ref cargo_dir = work_dir.join(".cargo");
+    let ref stdio_dir = work_dir.join("stdio");
+    let ref results_dir = work_dir.join("results");
+
+    fs::create_dir_all(cargo_dir).unwrap();
+    fs::create_dir_all(stdio_dir).unwrap();
+    fs::create_dir_all(results_dir).unwrap();
+
+    if fs::metadata(index_path).is_err() {
+        println!("initializing registry index");
         git2::Repository::clone("https://github.com/rust-lang/crates.io-index",
-                                ".index").unwrap();
-        fs::rename(".index", "index").unwrap();
+                                tmp_index_path).unwrap();
+        fs::rename(tmp_index_path, index_path).unwrap();
     }
 
-    let config = config();
+    // Update the Cargo registry just once before we begin
+    let config = config(&work_dir, Box::new(io::stdout()), Box::new(io::stderr()));
     let id = SourceId::for_central(&config).unwrap();
     let mut s = RegistrySource::new(&id, &config);
     s.update().unwrap();
 
-    let stdout = unsafe { libc::dup(1) };
-    let stderr = unsafe { libc::dup(2) };
-    assert!(stdout > 0 && stderr > 0);
+    let cargo_config = format!("
+        [build]
+        target-dir = './target'
+    ");
 
-    let root = env::current_dir().unwrap();
-    for krate in WalkDir::new("index").into_iter()
-                        .filter_entry(|e| !bad(e))
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().is_file())
-                        .map(|e| e.file_name().to_str().unwrap().to_string()) {
-        let root = root.join("output").join(&krate);
-        if fs::metadata(root.join("stdio")).is_ok() {
-            continue
+    File::create(cargo_dir.join("config")).unwrap()
+        .write_all(cargo_config.as_bytes()).unwrap();
+
+    let crates = WalkDir::new(index_path).into_iter()
+        .filter_entry(|e| !bad(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.file_name().to_str().unwrap().to_string());
+
+    for krate in crates {
+        let ref crate_stdio_dir = stdio_dir.join(&krate);
+        let ref crate_result_dir = results_dir.join(&krate);
+        let ref result_file = crate_result_dir.join("results.txt");
+
+        fs::create_dir_all(crate_stdio_dir).unwrap();
+        fs::create_dir_all(crate_result_dir).unwrap();
+
+        if fs::metadata(result_file).is_ok() {
+            println!("using existing results for: {}", krate);
+            continue;
         }
-        build(&root, &mut s, &id, &krate);
-        io::stdout().flush().unwrap();
-        unsafe {
-            assert_eq!(libc::dup2(stdout, 1), 1);
-            assert_eq!(libc::dup2(stderr, 2), 2);
-        }
+
+        println!("working on: {}", krate);
+
+        let result = build(work_dir, crate_stdio_dir, &krate);
+        report_result(&result_file, result);
     }
+}
+
+fn report_result(result_file: &Path, r: BuildResult) {
+    let s = match r {
+        BuildResult::Success => "ok".to_string(),
+        BuildResult::TestFail(e) => format!("bad test: {}", e),
+        BuildResult::BuildFail(e) => format!("bad build: {}", e),
+        BuildResult::Panic(e) => format!("bad panic: {}", e),
+    };
+
+    println!("{}", s);
+
+    let mut file = File::create(result_file).unwrap();
+    let _ = writeln!(file, "{}", s);
 }
 
 fn bad(entry: &DirEntry) -> bool {
@@ -59,26 +96,53 @@ fn bad(entry: &DirEntry) -> bool {
          .unwrap_or(false)
 }
 
-fn config() -> Config {
+fn config(work_dir: &Path, out: Box<Write + Send>, err: Box<Write + Send>) -> Config {
+    let work_dir = env::current_dir().unwrap().join(work_dir);
     let config = ShellConfig {
-        color_config: ColorConfig::Always,
-        tty: true,
+        color_config: ColorConfig::Never,
+        tty: false,
     };
-    let out = Shell::create(Box::new(io::stdout()), config);
-    let err = Shell::create(Box::new(io::stderr()), config);
+    let out = Shell::create(Box::new(out), config);
+    let err = Shell::create(Box::new(err), config);
     Config::new(MultiShell::new(out, err, Verbosity::Verbose),
-                env::current_dir().unwrap(),
-                env::home_dir().unwrap()).unwrap()
+                work_dir.to_owned(),
+                work_dir.join("cargo-home")).unwrap()
 }
 
-fn build(out: &Path, src: &mut RegistrySource, id: &SourceId, krate: &str) {
-    println!("working on: {}", krate);
-    fs::create_dir_all(&out).unwrap();
-    unsafe {
-        let stdout = File::create(out.join("stdio")).unwrap();
-        assert_eq!(libc::dup2(stdout.as_raw_fd(), 1), 1);
-        assert_eq!(libc::dup2(stdout.as_raw_fd(), 2), 2);
+enum BuildResult {
+    Success,
+    TestFail(String),
+    BuildFail(String),
+    Panic(String),
+}
+
+fn build(work_dir: &Path, out_dir: &Path, krate: &str) -> BuildResult {
+
+    use std::panic::catch_unwind;
+
+    let r = catch_unwind(|| {
+        build_(work_dir, out_dir, krate)
+    });
+
+    match r {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(e) = e.downcast_ref::<String>() {
+                BuildResult::Panic(e.to_string())
+            } else {
+                BuildResult::Panic("some panic".to_string())
+            }
+        }
     }
+}
+
+fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str) -> BuildResult {
+
+    let out = File::create(stdio_dir.join("stdout")).unwrap();
+    let err = File::create(stdio_dir.join("stderr")).unwrap();
+    let config = config(&work_dir, Box::new(out), Box::new(err));
+    let id = SourceId::for_central(&config).unwrap();
+    let mut src = RegistrySource::new(&id, &config);
 
     let dep = Dependency::parse(krate, None, &id).unwrap();
     let pkg = src.query(&dep).unwrap().iter().map(|v| v.package_id())
@@ -86,27 +150,43 @@ fn build(out: &Path, src: &mut RegistrySource, id: &SourceId, krate: &str) {
     let pkg = match pkg {
         Some(pkg) => pkg,
         None => {
-            return println!("failed to find {}", krate);
+            panic!("failed to find {}", krate);
         }
     };
 
     let pkg = match src.download(&pkg) {
         Ok(v) => v,
         Err(e) => {
-            return println!("bad get pkg: {}: {}", pkg, e);
+            panic!("bad get pkg: {}: {}", pkg, e);
         }
     };
 
-    fs::create_dir_all(".cargo").unwrap();
-    File::create(".cargo/config").unwrap().write_all(format!("
-        [build]
-        target-dir = '{}'
-    ", out.join("target").display()).as_bytes()).unwrap();
-
-    let config = config();
     let args = &["-Z".to_string(), "time-passes".to_string()];
-    let res = ops::compile_pkg(&pkg, None, &ops::CompileOptions {
-        config: &config,
+    let opts = compiler_opts(&config, args);
+    let res = ops::compile_pkg(&pkg, None, &opts);
+
+    if let Err(e) = res {
+        return BuildResult::BuildFail(format!("{}: {}", pkg, e));
+    }
+
+    let opts = &ops::TestOptions {
+        compile_opts: compiler_opts(&config, &[]),
+        no_run: false,
+        no_fail_fast: false,
+    };
+
+    let res = ops::run_tests(pkg.manifest_path(), opts, &[]);
+
+    if let Err(e) = res {
+        return BuildResult::TestFail(format!("{}: {}", pkg, e));
+    }
+
+    BuildResult::Success
+}
+
+fn compiler_opts<'a>(config: &'a Config, args: &'a [String]) -> ops::CompileOptions<'a> {
+    ops::CompileOptions {
+        config: config,
         jobs: None,
         target: None,
         features: &[],
@@ -124,11 +204,5 @@ fn build(out: &Path, src: &mut RegistrySource, id: &SourceId, krate: &str) {
         mode: ops::CompileMode::Build,
         target_rustc_args: Some(args),
         target_rustdoc_args: None,
-    });
-    fs::remove_file(".cargo/config").unwrap();
-    if let Err(e) = res {
-        println!("bad compile {}: {}", pkg, e);
-    } else {
-        println!("OK");
     }
 }
