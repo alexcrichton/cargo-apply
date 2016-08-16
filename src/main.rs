@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cargo::core::{Source, SourceId, Registry, Dependency};
 use cargo::ops;
@@ -37,6 +38,8 @@ arbitary code! Be wary.
 
 Options:
     --out DIR              Output directory [default: work].
+    -t, --test             Run tests.
+    -b, --bench            Run benchmarks.
     --release              Use release mode instead of debug.
 "#;
 
@@ -44,6 +47,8 @@ Options:
 struct Args {
     flag_out: String,
     flag_release: bool,
+    flag_test: bool,
+    flag_bench: bool,
     arg_package_name: Vec<String>,
 }
 
@@ -211,27 +216,41 @@ fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str, args: &Args) -> BuildR
     let rustc_args = &["-Z".to_string(), "time-passes".to_string()];
     let opts = compiler_opts(&config, rustc_args, args);
     let res = ops::compile_pkg(&pkg, None, &opts);
-
     if let Err(e) = res {
         return BuildResult::BuildFail(format!("{}: {}", pkg, e));
     }
 
-    let opts = &ops::TestOptions {
-        compile_opts: compiler_opts(&config, &[], &args),
-        no_run: false,
-        no_fail_fast: false,
-    };
+    if args.flag_test {
+        let opts = &test_opts(&config, &[], args);
 
-    let res = ops::run_tests(pkg.manifest_path(), opts, &[]);
+        let res = ops::run_tests(pkg.manifest_path(), opts, &[]);
 
-    if let Err(e) = res {
-        return BuildResult::TestFail(format!("{}: {}", pkg, e));
+        if let Err(e) = res {
+            return BuildResult::TestFail(format!("{}: {}", pkg, e));
+        }
+    }
+
+    if args.flag_bench {
+        let opts = &test_opts(&config, &[], args);
+
+        let start = Instant::now();
+        let result = ops::run_benches(pkg.manifest_path(), &opts, &[]);
+        let test_time = start.elapsed();
+
+        match result {
+            Ok(None) => println!("> benches passed for `{}`: {:?}", pkg, test_time),
+            Ok(Some(err)) => println!("> benches failed for `{}`: {}", pkg, err),
+            Err(err) => println!("> cargo error for `{}`: {}", pkg, err),
+        }
     }
 
     BuildResult::Success
 }
 
-fn compiler_opts<'a>(config: &'a Config, rustc_args: &'a [String], args: &Args) -> ops::CompileOptions<'a> {
+fn compiler_opts<'a>(config: &'a Config,
+                     rustc_args: &'a [String],
+                     args: &Args)
+                     -> ops::CompileOptions<'a> {
     ops::CompileOptions {
         config: config,
         jobs: None,
@@ -251,6 +270,17 @@ fn compiler_opts<'a>(config: &'a Config, rustc_args: &'a [String], args: &Args) 
         mode: ops::CompileMode::Build,
         target_rustc_args: Some(rustc_args),
         target_rustdoc_args: None,
+    }
+}
+
+fn test_opts<'a>(config: &'a Config,
+                 rustc_args: &'a [String],
+                 args: &Args)
+                 -> ops::TestOptions<'a> {
+    ops::TestOptions {
+        compile_opts: compiler_opts(&config, rustc_args, &args),
+        no_run: false,
+        no_fail_fast: false,
     }
 }
 
