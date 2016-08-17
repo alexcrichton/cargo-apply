@@ -108,11 +108,9 @@ fn main() {
 
     for krate in crates {
         let krate_str = krate.to_string();
-        let ref crate_stdio_dir = stdio_dir.join(&krate_str);
         let ref crate_result_dir = results_dir.join(&krate_str);
         let ref result_file = crate_result_dir.join("results.txt");
 
-        fs::create_dir_all(crate_stdio_dir).unwrap();
         fs::create_dir_all(crate_result_dir).unwrap();
 
         if fs::metadata(result_file).is_ok() {
@@ -122,7 +120,7 @@ fn main() {
 
         println!("working on: {}", krate);
 
-        let result = build(work_dir, crate_stdio_dir, &krate, &args);
+        let result = build(work_dir, stdio_dir, &krate, &args);
         report_result(&result_file, result);
     }
 }
@@ -159,12 +157,16 @@ fn config(work_dir: &Path, out: Box<Write + Send>, err: Box<Write + Send>) -> Co
 }
 
 fn build(work_dir: &Path,
-         out_dir: &Path,
+         stdio_dir: &Path,
          krate: &KrateName,
          args: &Args)
          -> Result<(), Box<Error>> {
 
     use std::panic::catch_unwind;
+
+    let krate_str = krate.to_string();
+    let ref out_dir = stdio_dir.join(&krate_str);
+    fs::create_dir_all(out_dir)?;
 
     let r = catch_unwind(|| build_(work_dir, out_dir, krate.clone(), args));
 
