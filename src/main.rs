@@ -213,14 +213,18 @@ fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str, args: &Args) -> BuildR
         }
     };
 
-    let rustc_args = &["-Z".to_string(), "time-passes".to_string()];
+    let rustc_args = &[];
     let opts = compiler_opts(&config, rustc_args, args);
+
+    println!("building: {}", krate);
     let res = ops::compile_pkg(&pkg, None, &opts);
     if let Err(e) = res {
         return BuildResult::BuildFail(format!("{}: {}", pkg, e));
     }
 
     if args.flag_test {
+        println!("testing: {}", krate);
+
         let opts = &test_opts(&config, &[], args);
 
         let res = ops::run_tests(pkg.manifest_path(), opts, &[]);
@@ -234,6 +238,7 @@ fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str, args: &Args) -> BuildR
         let opts = &test_opts(&config, &[], args);
 
         let start = Instant::now();
+        println!("benchmarking: {}", krate);
         let result = ops::run_benches(pkg.manifest_path(), &opts, &[]);
         let test_time = start.elapsed();
 
