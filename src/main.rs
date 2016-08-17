@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cargo::core::{Source, SourceId, Registry, Dependency};
 use cargo::ops;
@@ -43,6 +43,7 @@ Options:
     --out DIR              Output directory [default: work].
     -t, --test             Run tests.
     -b, --bench            Run benchmarks.
+    --force                Delete results left-over from prior runs.
     --release              Use release mode instead of debug.
 "#;
 
@@ -52,6 +53,7 @@ struct Args {
     flag_release: bool,
     flag_test: bool,
     flag_bench: bool,
+    flag_force: bool,
     arg_package_name: Vec<String>,
 }
 
@@ -114,8 +116,13 @@ fn main() {
         fs::create_dir_all(crate_result_dir).unwrap();
 
         if fs::metadata(result_file).is_ok() {
-            println!("using existing results for: {}", krate);
-            continue;
+            if !args.flag_force {
+                println!("using existing results for: {}", krate);
+                continue;
+            } else {
+                println!("deleting existing results for: {}", krate);
+                fs::remove_file(&result_file).unwrap();
+            }
         }
 
         println!("working on: {}", krate);
@@ -125,9 +132,9 @@ fn main() {
     }
 }
 
-fn report_result(result_file: &Path, r: Result<(), Box<Error>>) {
+fn report_result(result_file: &Path, r: Result<Timing, Box<Error>>) {
     let s = match r {
-        Ok(()) => format!("ok"),
+        Ok(timing) => format!("{:?}", timing),
         Err(err) => format!("{}", err),
     };
 
@@ -160,7 +167,7 @@ fn build(work_dir: &Path,
          stdio_dir: &Path,
          krate: &KrateName,
          args: &Args)
-         -> Result<(), Box<Error>> {
+         -> Result<Timing, Box<Error>> {
 
     use std::panic::catch_unwind;
 
@@ -171,7 +178,8 @@ fn build(work_dir: &Path,
     let r = catch_unwind(|| build_(work_dir, out_dir, krate.clone(), args));
 
     match r {
-        Ok(r) => r,
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(e)) => Err(e),
         Err(e) => {
             if let Some(e) = e.downcast_ref::<String>() {
                 Err(BuildError::Panic(krate.clone(), e.to_string()).into())
@@ -186,7 +194,7 @@ fn build_(work_dir: &Path,
           stdio_dir: &Path,
           krate: KrateName,
           args: &Args)
-          -> Result<(), Box<Error>> {
+          -> Result<Timing, Box<Error>> {
     let out = File::create(stdio_dir.join("stdout"))?;
     let err = File::create(stdio_dir.join("stderr"))?;
     let config = config(&work_dir, Box::new(out), Box::new(err));
@@ -213,32 +221,37 @@ fn build_(work_dir: &Path,
     let opts = compiler_opts(&config, rustc_args, args);
 
     println!("building: {}", krate);
-    ops::compile_pkg(&pkg, None, &opts)?;
+    let compile_time = measure(|| Ok({ops::compile_pkg(&pkg, None, &opts)?;}))?;
 
+    let mut test_time = None;
     if args.flag_test {
         println!("testing: {}", krate);
-
         let opts = &test_opts(&config, &[], args);
-
-        ops::run_tests(pkg.manifest_path(), opts, &[])?;
+        test_time = Some(measure(|| Ok({ops::run_tests(pkg.manifest_path(), opts, &[])?;}))?)
     }
 
+    let mut bench_time = None;
     if args.flag_bench {
         let opts = &test_opts(&config, &[], args);
 
         let start = Instant::now();
         println!("benchmarking: {}", krate);
-        let result = ops::run_benches(pkg.manifest_path(), &opts, &[]);
-        let test_time = start.elapsed();
-
-        match result {
-            Ok(None) => println!("> benches passed for `{}`: {:?}", pkg, test_time),
-            Ok(Some(err)) => println!("> benches failed for `{}`: {}", pkg, err),
-            Err(err) => println!("> cargo error for `{}`: {}", pkg, err),
-        }
+        ops::run_benches(pkg.manifest_path(), &opts, &[])?;
+        bench_time = Some(start.elapsed());
     }
 
-    Ok(())
+    Ok(Timing {
+        krate: krate,
+        build: compile_time,
+        test: test_time,
+        bench: bench_time,
+    })
+}
+
+fn measure<F>(op: F) -> Result<Duration, Box<Error>> where F: FnOnce() -> Result<(), Box<Error>> {
+    let start = Instant::now();
+    op()?;
+    Ok(start.elapsed())
 }
 
 fn compiler_opts<'a>(config: &'a Config,
@@ -325,6 +338,14 @@ impl fmt::Display for KrateName {
             write!(fmt, "{}", self.name)
         }
     }
+}
+
+#[derive(Debug)]
+struct Timing {
+    krate: KrateName,
+    build: Duration,
+    test: Option<Duration>,
+    bench: Option<Duration>,
 }
 
 #[derive(Debug)]
