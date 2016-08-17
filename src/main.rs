@@ -1,3 +1,5 @@
+#![feature(question_mark)]
+
 extern crate cargo;
 extern crate docopt;
 extern crate git2;
@@ -6,6 +8,7 @@ extern crate libc;
 extern crate regex;
 extern crate rustc_serialize;
 
+use std::error::Error;
 use std::env;
 use std::fmt;
 use std::fs::{self, File};
@@ -119,20 +122,16 @@ fn main() {
 
         println!("working on: {}", krate);
 
-        let result = build(work_dir, crate_stdio_dir, &krate_str, &args);
+        let result = build(work_dir, crate_stdio_dir, &krate, &args);
         report_result(&result_file, result);
     }
 }
 
-fn report_result(result_file: &Path, r: BuildResult) {
+fn report_result(result_file: &Path, r: Result<(), Box<Error>>) {
     let s = match r {
-        BuildResult::Success => "ok".to_string(),
-        BuildResult::TestFail(e) => format!("bad test: {}", e),
-        BuildResult::BuildFail(e) => format!("bad build: {}", e),
-        BuildResult::Panic(e) => format!("bad panic: {}", e),
+        Ok(()) => format!("ok"),
+        Err(err) => format!("{}", err),
     };
-
-    println!("{}", s);
 
     let mut file = File::create(result_file).unwrap();
     let _ = writeln!(file, "{}", s);
@@ -159,79 +158,67 @@ fn config(work_dir: &Path, out: Box<Write + Send>, err: Box<Write + Send>) -> Co
         .unwrap()
 }
 
-enum BuildResult {
-    Success,
-    TestFail(String),
-    BuildFail(String),
-    Panic(String),
-}
-
-fn build(work_dir: &Path, out_dir: &Path, krate: &str, args: &Args) -> BuildResult {
+fn build(work_dir: &Path,
+         out_dir: &Path,
+         krate: &KrateName,
+         args: &Args)
+         -> Result<(), Box<Error>> {
 
     use std::panic::catch_unwind;
 
-    let r = catch_unwind(|| build_(work_dir, out_dir, krate, args));
+    let r = catch_unwind(|| build_(work_dir, out_dir, krate.clone(), args));
 
     match r {
         Ok(r) => r,
         Err(e) => {
             if let Some(e) = e.downcast_ref::<String>() {
-                BuildResult::Panic(e.to_string())
+                Err(BuildError::Panic(krate.clone(), e.to_string()).into())
             } else {
-                BuildResult::Panic("some panic".to_string())
+                Err(BuildError::Panic(krate.clone(), "some panic".to_string()).into())
             }
         }
     }
 }
 
-fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str, args: &Args) -> BuildResult {
-
-    let out = File::create(stdio_dir.join("stdout")).unwrap();
-    let err = File::create(stdio_dir.join("stderr")).unwrap();
+fn build_(work_dir: &Path,
+          stdio_dir: &Path,
+          krate: KrateName,
+          args: &Args)
+          -> Result<(), Box<Error>> {
+    let out = File::create(stdio_dir.join("stdout"))?;
+    let err = File::create(stdio_dir.join("stderr"))?;
     let config = config(&work_dir, Box::new(out), Box::new(err));
-    let id = SourceId::for_central(&config).unwrap();
+    let id = SourceId::for_central(&config)?;
     let mut src = RegistrySource::new(&id, &config);
 
-    let dep = Dependency::parse(krate, None, &id).unwrap();
-    let pkg = src.query(&dep)
-        .unwrap()
+    let dep = Dependency::parse(&krate.name, krate.version.as_ref().map(|s| &s[..]), &id)?;
+    let pkg = src.query(&dep)?
         .iter()
         .map(|v| v.package_id())
         .max()
         .cloned();
     let pkg = match pkg {
         Some(pkg) => pkg,
-        None => {
-            panic!("failed to find {}", krate);
-        }
+        None => return Err(BuildError::NotInRegistry(krate).into()),
     };
 
     let pkg = match src.download(&pkg) {
         Ok(v) => v,
-        Err(e) => {
-            panic!("bad get pkg: {}: {}", pkg, e);
-        }
+        Err(e) => return Err(BuildError::FailedToDownload(krate, e.into()).into()),
     };
 
     let rustc_args = &[];
     let opts = compiler_opts(&config, rustc_args, args);
 
     println!("building: {}", krate);
-    let res = ops::compile_pkg(&pkg, None, &opts);
-    if let Err(e) = res {
-        return BuildResult::BuildFail(format!("{}: {}", pkg, e));
-    }
+    ops::compile_pkg(&pkg, None, &opts)?;
 
     if args.flag_test {
         println!("testing: {}", krate);
 
         let opts = &test_opts(&config, &[], args);
 
-        let res = ops::run_tests(pkg.manifest_path(), opts, &[]);
-
-        if let Err(e) = res {
-            return BuildResult::TestFail(format!("{}: {}", pkg, e));
-        }
+        ops::run_tests(pkg.manifest_path(), opts, &[])?;
     }
 
     if args.flag_bench {
@@ -249,7 +236,7 @@ fn build_(work_dir: &Path, stdio_dir: &Path, krate: &str, args: &Args) -> BuildR
         }
     }
 
-    BuildResult::Success
+    Ok(())
 }
 
 fn compiler_opts<'a>(config: &'a Config,
@@ -334,6 +321,46 @@ impl fmt::Display for KrateName {
             write!(fmt, "{}={}", self.name, ver)
         } else {
             write!(fmt, "{}", self.name)
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BuildError {
+    NotInRegistry(KrateName),
+    FailedToDownload(KrateName, Box<Error>),
+    Panic(KrateName, String),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        use BuildError::*;
+        match *self {
+            NotInRegistry(ref k) => write!(fmt, "crate `{}` not in registry", k),
+            FailedToDownload(ref k, ref e) => {
+                write!(fmt, "crate `{}` failed to download: {}", k, e)
+            }
+            Panic(ref k, ref s) => write!(fmt, "crate `{}` encountered a misc panic: {}", k, s),
+        }
+    }
+}
+
+impl Error for BuildError {
+    fn description(&self) -> &str {
+        use BuildError::*;
+        match *self {
+            NotInRegistry(..) => "not in registry",
+            FailedToDownload(..) => "failed to download",
+            Panic(..) => "unexpected panic",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        use BuildError::*;
+        match *self {
+            NotInRegistry(..) |
+            Panic(..) => None,
+            FailedToDownload(_, ref e) => Some(&**e),
         }
     }
 }
