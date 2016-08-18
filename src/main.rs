@@ -15,7 +15,8 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Instant;
 
 use cargo::core::{Source, SourceId, Registry, Dependency};
 use cargo::ops;
@@ -64,21 +65,38 @@ struct KrateName {
 }
 
 fn main() {
+    // This is a bit crafty. We want to invoke ourselves, and we want
+    // to do it using a secret option `--recurse` which must come first.
+    let args: Vec<String> = env::args().collect();
+    if args[1] == "--recurse" {
+        recursive_invocation(args);
+    } else {
+        base_invocation(args);
+    }
+}
+
+fn base_invocation(arg_strings: Vec<String>) {
+    // Parse the argument strings.
     let args: Args = Docopt::new(USAGE)
-        .and_then(|d| d.argv(env::args()).decode())
+        .and_then(|d| d.argv(&arg_strings).decode())
         .unwrap_or_else(|e| e.exit());
 
+    // Extract out the configuration options. These will
+    // be all arguments but the last N.
+    let limit = arg_strings.len() - args.arg_package_name.len();
+    let config_options = &arg_strings[..limit];
+
+    // Compute the paths to various important directories and create
+    // them.
     let ref work_dir = PathBuf::from(&args.flag_out);
     let ref index_path = work_dir.join("index");
     let ref tmp_index_path = work_dir.join(".index");
     let ref cargo_dir = work_dir.join(".cargo");
-    let ref stdio_dir = work_dir.join("stdio");
-    let ref results_dir = work_dir.join("results");
-
+    let ref output_dir = work_dir.join("output");
     fs::create_dir_all(cargo_dir).unwrap();
-    fs::create_dir_all(stdio_dir).unwrap();
-    fs::create_dir_all(results_dir).unwrap();
+    fs::create_dir_all(output_dir).unwrap();
 
+    // Initialize the index and load it via git.
     if fs::metadata(index_path).is_err() {
         println!("initializing registry index");
         git2::Repository::clone("https://github.com/rust-lang/crates.io-index",
@@ -93,53 +111,86 @@ fn main() {
     let mut s = RegistrySource::new(&id, &config);
     s.update().unwrap();
 
+    // Create a cargo configuration that directs all builds into a
+    // shared directory. This allows us to re-use work.
     let cargo_config = format!("
         [build]
         target-dir = './target'
     ");
-
     File::create(cargo_dir.join("config"))
         .unwrap()
         .write_all(cargo_config.as_bytes())
         .unwrap();
 
-    let crates: Vec<_> = match assemble_crate_names(&args, &index_path) {
+    // Assemble the full list of crates we want to process.
+    let crates: Vec<_> = match assemble_crate_names(&args.arg_package_name, &index_path) {
         Ok(v) => v,
         Err(()) => return,
     };
 
+    // Iterate over the crates. For each one, we will recursively
+    // spawn ourselves in a separate process, redirecting the stdout
+    // and stderr into files. The return code of this recursive
+    // process also tells us what happened.
     for krate in crates {
-        let krate_str = krate.to_string();
-        let ref crate_result_dir = results_dir.join(&krate_str);
-        let ref result_file = crate_result_dir.join("results.txt");
-
-        fs::create_dir_all(crate_result_dir).unwrap();
-
-        if fs::metadata(result_file).is_ok() {
-            if !args.flag_force {
-                println!("using existing results for: {}", krate);
-                continue;
-            } else {
-                println!("deleting existing results for: {}", krate);
-                fs::remove_file(&result_file).unwrap();
+        match process_crate(config_options, &output_dir, &args, &krate) {
+            Ok(()) => { }
+            Err(err) => {
+                println!("{}: error `{}`", krate, err);
             }
         }
-
-        println!("working on: {}", krate);
-
-        let result = build(work_dir, stdio_dir, &krate, &args);
-        report_result(&result_file, result);
     }
 }
 
-fn report_result(result_file: &Path, r: Result<Timing, Box<Error>>) {
-    let s = match r {
-        Ok(timing) => format!("{:?}", timing),
-        Err(err) => format!("{}", err),
-    };
+fn process_crate(config_options: &[String],
+                 output_dir: &Path,
+                 args: &Args,
+                 krate: &KrateName)
+                 -> Result<(), Box<Error>> {
+    let krate_str = krate.to_string();
+    let ref krate_dir = output_dir.join(&krate_str);
 
-    let mut file = File::create(result_file).unwrap();
-    let _ = writeln!(file, "{}", s);
+    fs::create_dir_all(krate_dir)?;
+
+    let out_path = krate_dir.join("stdout");
+    let err_path = krate_dir.join("stderr");
+    let result_path = krate_dir.join("results.txt");
+
+    // Skip if a result file already exists.
+    if fs::metadata(&result_path).is_ok() {
+        if !args.flag_force {
+            println!("{}: re-using existing results", krate);
+            return Ok(());
+        }
+    }
+
+    println!("{}: processing", krate);
+
+    // Delete old files if they exist.
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&err_path);
+    let _ = fs::remove_file(&result_path);
+
+    // Recursively invoke ourselves with `--recurse`,
+    // the configuration options, and the krate to process.
+    let output = Command::new(env::current_exe()?)
+        .arg("--recurse")
+        .args(config_options)
+        .arg(&krate_str)
+        .output()?;
+
+    // Save the output into stdio/stderr. Create result file last.
+    let mut out_file = File::create(out_path)?;
+    out_file.write_all(&output.stdout)?;
+    let mut err_file = File::create(err_path)?;
+    err_file.write_all(&output.stderr)?;
+    let mut result_file = File::create(result_path)?;
+    write!(result_file, "exit code `{:?}`", output.status)?;
+    if !output.status.success() {
+        println!("{}: completed with error code {:?}", krate, output.status);
+    }
+
+    Ok(())
 }
 
 fn bad(entry: &DirEntry) -> bool {
@@ -163,41 +214,28 @@ fn config(work_dir: &Path, out: Box<Write + Send>, err: Box<Write + Send>) -> Co
         .unwrap()
 }
 
-fn build(work_dir: &Path,
-         stdio_dir: &Path,
-         krate: &KrateName,
-         args: &Args)
-         -> Result<Timing, Box<Error>> {
+fn recursive_invocation(mut arg_strings: Vec<String>) {
+    arg_strings.remove(1); // drop the `--recurse` flag
+    let args: Args = Docopt::new(USAGE)
+        .and_then(|d| d.argv(&arg_strings[1..]).decode())
+        .unwrap_or_else(|e| e.exit());
 
-    use std::panic::catch_unwind;
+    // FIXME not dry
+    let ref work_dir = PathBuf::from(&args.flag_out);
+    let ref index_path = work_dir.join("index");
 
-    let krate_str = krate.to_string();
-    let ref out_dir = stdio_dir.join(&krate_str);
-    fs::create_dir_all(out_dir)?;
-
-    let r = catch_unwind(|| build_(work_dir, out_dir, krate.clone(), args));
-
-    match r {
-        Ok(Ok(t)) => Ok(t),
-        Ok(Err(e)) => Err(e),
-        Err(e) => {
-            if let Some(e) = e.downcast_ref::<String>() {
-                Err(BuildError::Panic(krate.clone(), e.to_string()).into())
-            } else {
-                Err(BuildError::Panic(krate.clone(), "some panic".to_string()).into())
-            }
-        }
+    // We expect exactly one crate name.
+    let krate_names = assemble_crate_names(&args.arg_package_name, &index_path).unwrap();
+    for krate in krate_names {
+        build_crate(work_dir, krate.clone(), &args).unwrap();
     }
 }
 
-fn build_(work_dir: &Path,
-          stdio_dir: &Path,
-          krate: KrateName,
-          args: &Args)
-          -> Result<Timing, Box<Error>> {
-    let out = File::create(stdio_dir.join("stdout"))?;
-    let err = File::create(stdio_dir.join("stderr"))?;
-    let config = config(&work_dir, Box::new(out), Box::new(err));
+fn build_crate(work_dir: &Path,
+               krate: KrateName,
+               args: &Args)
+               -> Result<(), Box<Error>> {
+    let config = config(&work_dir, Box::new(io::stdout()), Box::new(io::stderr()));
     let id = SourceId::for_central(&config)?;
     let mut src = RegistrySource::new(&id, &config);
 
@@ -220,38 +258,34 @@ fn build_(work_dir: &Path,
     let rustc_args = &[];
     let opts = compiler_opts(&config, rustc_args, args);
 
-    println!("building: {}", krate);
-    let compile_time = measure(|| Ok({ops::compile_pkg(&pkg, None, &opts)?;}))?;
+    {
+        println!("building: {}", krate);
+        let start = Instant::now();
+        ops::compile_pkg(&pkg, None, &opts)?;
+        let compile_time = start.elapsed();
+        println!("krate `{}` built in {:?}", krate, compile_time);
+    }
 
-    let mut test_time = None;
     if args.flag_test {
         println!("testing: {}", krate);
         let opts = &test_opts(&config, &[], args);
-        test_time = Some(measure(|| Ok({ops::run_tests(pkg.manifest_path(), opts, &[])?;}))?)
+        let start = Instant::now();
+        ops::run_tests(pkg.manifest_path(), opts, &[])?;
+        let test_time = start.elapsed();
+        println!("krate `{}` tested in {:?}", krate, test_time);
     }
 
-    let mut bench_time = None;
     if args.flag_bench {
         let opts = &test_opts(&config, &[], args);
 
         let start = Instant::now();
         println!("benchmarking: {}", krate);
         ops::run_benches(pkg.manifest_path(), &opts, &[])?;
-        bench_time = Some(start.elapsed());
+        let bench_time = start.elapsed();
+        println!("krate `{}` benchmarked in {:?}", krate, bench_time);
     }
 
-    Ok(Timing {
-        krate: krate,
-        build: compile_time,
-        test: test_time,
-        bench: bench_time,
-    })
-}
-
-fn measure<F>(op: F) -> Result<Duration, Box<Error>> where F: FnOnce() -> Result<(), Box<Error>> {
-    let start = Instant::now();
-    op()?;
-    Ok(start.elapsed())
+    Ok(())
 }
 
 fn compiler_opts<'a>(config: &'a Config,
@@ -291,8 +325,10 @@ fn test_opts<'a>(config: &'a Config,
     }
 }
 
-fn assemble_crate_names(args: &Args, index_path: &Path) -> Result<Vec<KrateName>, ()> {
-    if args.arg_package_name.iter().any(|s| s == "*") {
+fn assemble_crate_names(arg_package_names: &[String],
+                        index_path: &Path)
+                        -> Result<Vec<KrateName>, ()> {
+    if arg_package_names.iter().any(|s| s == "*") {
         // assemble the list from the index
         Ok(WalkDir::new(index_path)
             .into_iter()
@@ -308,9 +344,8 @@ fn assemble_crate_names(args: &Args, index_path: &Path) -> Result<Vec<KrateName>
             })
             .collect())
     } else {
-        let regex = Regex::new(r"\s*([^=\s]+)\s*(?:=\s*[^=\s]+)?").unwrap();
-        args.arg_package_name
-            .iter()
+        let regex = Regex::new(r"\s*([^=\s]+)\s*(?:=\s*([^=\s]+))?").unwrap();
+        arg_package_names.iter()
             .map(|str| {
                 match regex.captures(&str) {
                     Some(captures) => {
@@ -341,18 +376,9 @@ impl fmt::Display for KrateName {
 }
 
 #[derive(Debug)]
-struct Timing {
-    krate: KrateName,
-    build: Duration,
-    test: Option<Duration>,
-    bench: Option<Duration>,
-}
-
-#[derive(Debug)]
 enum BuildError {
     NotInRegistry(KrateName),
     FailedToDownload(KrateName, Box<Error>),
-    Panic(KrateName, String),
 }
 
 impl fmt::Display for BuildError {
@@ -363,7 +389,6 @@ impl fmt::Display for BuildError {
             FailedToDownload(ref k, ref e) => {
                 write!(fmt, "crate `{}` failed to download: {}", k, e)
             }
-            Panic(ref k, ref s) => write!(fmt, "crate `{}` encountered a misc panic: {}", k, s),
         }
     }
 }
@@ -374,15 +399,13 @@ impl Error for BuildError {
         match *self {
             NotInRegistry(..) => "not in registry",
             FailedToDownload(..) => "failed to download",
-            Panic(..) => "unexpected panic",
         }
     }
 
     fn cause(&self) -> Option<&Error> {
         use BuildError::*;
         match *self {
-            NotInRegistry(..) |
-            Panic(..) => None,
+            NotInRegistry(..) => None,
             FailedToDownload(_, ref e) => Some(&**e),
         }
     }
