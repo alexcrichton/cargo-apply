@@ -68,7 +68,7 @@ fn main() {
     // This is a bit crafty. We want to invoke ourselves, and we want
     // to do it using a secret option `--recurse` which must come first.
     let args: Vec<String> = env::args().collect();
-    if args[1] == "--recurse" {
+    if args.len() >= 2 && args[1] == "--recurse" {
         recursive_invocation(args);
     } else {
         base_invocation(args);
