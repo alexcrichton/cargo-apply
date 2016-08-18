@@ -8,6 +8,7 @@ extern crate libc;
 extern crate regex;
 extern crate rustc_serialize;
 
+use std::char;
 use std::error::Error;
 use std::env;
 use std::fmt;
@@ -44,6 +45,7 @@ Options:
     --out DIR              Output directory [default: work].
     -t, --test             Run tests.
     -b, --bench            Run benchmarks.
+    --build-flags FLAGS    Arguments for `rustc` when building [default: -Z time-passes].
     --force                Delete results left-over from prior runs.
     --release              Use release mode instead of debug.
 "#;
@@ -55,6 +57,7 @@ struct Args {
     flag_test: bool,
     flag_bench: bool,
     flag_force: bool,
+    flag_build_flags: String,
     arg_package_name: Vec<String>,
 }
 
@@ -255,11 +258,12 @@ fn build_crate(work_dir: &Path,
         Err(e) => return Err(BuildError::FailedToDownload(krate, e.into()).into()),
     };
 
-    let rustc_args = &[];
-    let opts = compiler_opts(&config, rustc_args, args);
-
     {
         println!("building: {}", krate);
+        let rustc_args: Vec<_> = args.flag_build_flags.split(char::is_whitespace)
+                                                      .map(|s| s.to_string())
+                                                      .collect();
+        let opts = compiler_opts(&config, &rustc_args, args);
         let start = Instant::now();
         ops::compile_pkg(&pkg, None, &opts)?;
         let compile_time = start.elapsed();
